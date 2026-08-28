@@ -1,0 +1,13 @@
+# Compiled binary
+server
+aba-payway-go
+*.exe
+
+# Env files
+.env
+.env.local
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
