@@ -546,13 +546,27 @@ func (a *App) maintainWarmPool() {
 // takeTab returns a pre-navigated tab from the pool if one is ready
 // within a short wait, otherwise prepares one fresh on the spot (the
 // old, slower path — but still on the shared browser process).
+// takeTab returns a pre-navigated tab from the pool if one is ready
+// within a short wait, otherwise prepares one fresh on the spot (the
+// old, slower path — but still on the shared browser process). The
+// fresh-tab path retries once on failure: right after a cold start,
+// the first attempt can occasionally get interrupted (e.g. Chrome's
+// process still stabilizing) and return a transient error like
+// "context canceled" — a single retry clears that without surfacing
+// it to the caller.
 func (a *App) takeTab() (context.Context, context.CancelFunc, error) {
 	select {
 	case t := <-a.warmTabs:
 		return t.ctx, t.cancel, nil
 	case <-time.After(300 * time.Millisecond):
-		return a.newPreparedTab()
 	}
+
+	ctx, cancel, err := a.newPreparedTab()
+	if err != nil {
+		ctx, cancel, err = a.newPreparedTab()
+	}
+
+	return ctx, cancel, err
 }
 
 func (a *App) startPayWayBrowser(
