@@ -3,6 +3,8 @@ FROM golang:1.23-bookworm AS builder
 
 WORKDIR /app
 
+ENV GOTOOLCHAIN=auto
+
 COPY go.mod go.sum ./
 RUN go mod download
 
