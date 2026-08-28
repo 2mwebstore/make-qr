@@ -85,6 +85,14 @@ type App struct {
 	// several seconds per request.
 	browserCtx context.Context
 
+	// browserReady is closed once Chrome startup finishes — success or
+	// failure. Everything that needs the browser waits on this instead
+	// of blocking the whole process (and the HTTP listener) at boot.
+	// Written once, before the close, from initBrowser's goroutine;
+	// the close establishes happens-before for any reader.
+	browserReady chan struct{}
+	browserErr   error
+
 	// warmTabs holds tabs that are already navigated to the PayWay
 	// checkout page and idle, ready to be handed to a request. This
 	// takes page-load latency out of the request's critical path.
@@ -103,6 +111,41 @@ type CreatePaymentRequest struct {
 }
 
 func main() {
+	app := &App{
+		payments:     make(map[int64]*Payment),
+		warmTabs:     make(chan warmTab, 2),
+		poolSize:     2,
+		browserReady: make(chan struct{}),
+	}
+
+	// Chrome starts in the background — the HTTP server (and /health)
+	// comes up immediately regardless of how long Chrome takes, or
+	// whether it fails entirely.
+	go app.initBrowser()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", app.health)
+	mux.HandleFunc("POST /api/payments/qr", app.createPayment)
+	mux.HandleFunc("GET /api/payments/{id}/status", app.paymentStatus)
+
+	port := getenv("PORT", "8080")
+
+	if err := http.ListenAndServe(
+		":"+port,
+		cors(mux),
+	); err != nil {
+		fmt.Fprintln(os.Stderr, "http server failed:", err)
+		os.Exit(1)
+	}
+}
+
+// initBrowser launches the shared Chrome instance and, on success,
+// keeps the warm-tab pool topped up for the rest of the process's
+// life. On failure it records the error (surfaced via /health and via
+// any payment request, which will fail with this same message) rather
+// than crashing the whole process — the HTTP server stays up either
+// way.
+func (a *App) initBrowser() {
 	allocOpts := append(
 		chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
@@ -114,8 +157,6 @@ func main() {
 			"AutomationControlled",
 		),
 		chromedp.Flag("window-size", "1280,900"),
-		// Trim extra Chrome subsystems we don't need — shaves time
-		// off the (now one-time) startup.
 		chromedp.Flag("disable-extensions", true),
 		chromedp.Flag("disable-background-networking", true),
 		chromedp.Flag("disable-sync", true),
@@ -136,49 +177,44 @@ func main() {
 
 	browserCtx, _ := chromedp.NewContext(allocCtx)
 
-	// Force Chrome to actually launch now, at startup, instead of on
-	// the first payment request.
 	if err := chromedp.Run(browserCtx); err != nil {
-		os.Exit(1)
+		a.browserErr = fmt.Errorf("chrome launch failed: %w", err)
+		fmt.Fprintln(os.Stderr, a.browserErr)
+		close(a.browserReady)
+		return
 	}
 
-	app := &App{
-		payments:   make(map[int64]*Payment),
-		browserCtx: browserCtx,
-		warmTabs:   make(chan warmTab, 2),
-		poolSize:   2,
-	}
+	a.browserCtx = browserCtx
+	close(a.browserReady)
 
-	// Keep the pool topped up in the background for the app's whole
-	// lifetime.
-	go app.maintainWarmPool()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", app.health)
-	mux.HandleFunc("POST /api/payments/qr", app.createPayment)
-	mux.HandleFunc("GET /api/payments/{id}/status", app.paymentStatus)
-
-	port := getenv("PORT", "8080")
-
-	if err := http.ListenAndServe(
-		":"+port,
-		cors(mux),
-	); err != nil {
-		os.Exit(1)
-	}
+	a.maintainWarmPool()
 }
 
 func (a *App) health(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	resp := map[string]interface{}{
+		"status": "ok",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	}
+
+	select {
+	case <-a.browserReady:
+		if a.browserErr != nil {
+			resp["browser"] = "error"
+			resp["browser_error"] = a.browserErr.Error()
+		} else {
+			resp["browser"] = "ready"
+		}
+	default:
+		resp["browser"] = "starting"
+	}
+
 	writeJSON(
 		w,
 		http.StatusOK,
-		map[string]interface{}{
-			"status": "ok",
-			"time":   time.Now().UTC().Format(time.RFC3339),
-		},
+		resp,
 	)
 }
 
@@ -380,6 +416,15 @@ var resourceBlockPatterns = []*network.BlockPattern{
 // event listener is attached here — those are added by whoever
 // consumes the tab, since they need the specific payment in scope.
 func (a *App) newPreparedTab() (context.Context, context.CancelFunc, error) {
+	// Waits for Chrome startup to finish (success or failure) instead
+	// of assuming a.browserCtx is already set — a request can arrive
+	// before initBrowser finishes, especially right after a cold start.
+	<-a.browserReady
+
+	if a.browserErr != nil {
+		return nil, nil, a.browserErr
+	}
+
 	ctx, cancel := chromedp.NewContext(a.browserCtx)
 
 	if err := chromedp.Run(
