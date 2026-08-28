@@ -98,6 +98,13 @@ type App struct {
 	// takes page-load latency out of the request's critical path.
 	warmTabs chan warmTab
 	poolSize int
+
+	// tabSetupSem limits how many tab-setup operations (navigate + wait
+	// for the amount form) run at once, across both the warm-pool
+	// background goroutine and any request that falls through to the
+	// fresh-tab path. Prevents a burst of concurrent requests from all
+	// hammering the one shared Chrome process simultaneously.
+	tabSetupSem chan struct{}
 }
 
 // warmTab is a pre-navigated tab sitting idle in the pool.
@@ -116,6 +123,7 @@ func main() {
 		warmTabs:     make(chan warmTab, 2),
 		poolSize:     2,
 		browserReady: make(chan struct{}),
+		tabSetupSem:  make(chan struct{}, 3),
 	}
 
 	// Chrome starts in the background — the HTTP server (and /health)
@@ -224,7 +232,13 @@ func (a *App) initBrowser() {
 
 	browserCtx, _ := chromedp.NewContext(allocCtx)
 
-	if err := chromedp.Run(browserCtx); err != nil {
+	// Bound only the initial process launch — if Chrome ever hangs on
+	// startup, this must not hang forever, since that would block
+	// browserReady from ever closing and stall every request.
+	launchCtx, launchCancel := context.WithTimeout(browserCtx, 30*time.Second)
+	defer launchCancel()
+
+	if err := chromedp.Run(launchCtx); err != nil {
 		a.browserErr = fmt.Errorf("chrome launch failed: %w", err)
 		fmt.Fprintln(os.Stderr, a.browserErr)
 		close(a.browserReady)
@@ -472,10 +486,30 @@ func (a *App) newPreparedTab() (context.Context, context.CancelFunc, error) {
 		return nil, nil, a.browserErr
 	}
 
+	// Caps how many tab-setup operations run at once. Without this, a
+	// burst of concurrent requests each navigates simultaneously,
+	// which can overload a single shared Chrome process on a small
+	// container — this is what was causing some requests to just
+	// never respond under concurrent load.
+	select {
+	case a.tabSetupSem <- struct{}{}:
+		defer func() { <-a.tabSetupSem }()
+	case <-time.After(25 * time.Second):
+		return nil, nil, fmt.Errorf("timed out waiting for a free browser slot")
+	}
+
 	ctx, cancel := chromedp.NewContext(a.browserCtx)
 
+	// Bound the setup itself — if a navigation or selector wait ever
+	// stalls (Chrome overloaded, page unresponsive), this must fail
+	// instead of hanging the request forever. setupCancel only cancels
+	// this child context, not the tab (ctx) itself, so the tab stays
+	// usable afterward if setup succeeded in time.
+	setupCtx, setupCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer setupCancel()
+
 	if err := chromedp.Run(
-		ctx,
+		setupCtx,
 		network.Enable().
 			WithMaxPostDataSize(10*1024*1024).
 			WithMaxTotalBufferSize(20*1024*1024).
@@ -529,10 +563,16 @@ func (a *App) startPayWayBrowser(
 		return QRResult{}, fmt.Errorf("prepare tab: %w", err)
 	}
 
+	// Absolute ceiling for the whole request, from amount entry through
+	// waiting on ABA's own check-payment-status call. The actual flow
+	// normally finishes in a few seconds; this is a safety net so a
+	// stuck request fails within a bounded, sane window instead of
+	// hanging for minutes (the 45s wait further below for the QR/hook
+	// fields already covers the expected-slow case).
 	ctx, timeoutCancel :=
 		context.WithTimeout(
 			tabCtx,
-			12*time.Minute,
+			90*time.Second,
 		)
 
 	cancelAll := func() {
