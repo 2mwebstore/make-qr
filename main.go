@@ -145,6 +145,48 @@ func main() {
 // any payment request, which will fail with this same message) rather
 // than crashing the whole process — the HTTP server stays up either
 // way.
+// chromeCandidatePaths are checked in order when CHROME_PATH isn't
+// set, or points at something that doesn't actually exist. Covers the
+// binary names/paths the common Debian/Ubuntu chromium and
+// google-chrome packages actually install.
+var chromeCandidatePaths = []string{
+	"/usr/bin/chromium",
+	"/usr/bin/chromium-browser",
+	"/usr/bin/google-chrome",
+	"/usr/bin/google-chrome-stable",
+	"/usr/lib/chromium/chromium",
+}
+
+// findChromeExecPath returns a real, existing browser binary path.
+// CHROME_PATH is honored if set AND the file actually exists there;
+// otherwise every candidate in chromeCandidatePaths is checked via
+// os.Stat (a real filesystem check, not chromedp's own internal
+// guesswork) and the first hit is used. If nothing is found, the
+// error lists every path that was tried so the real misconfiguration
+// is visible instead of a generic "no such file" for one guessed name.
+func findChromeExecPath() (string, error) {
+	tried := []string{}
+
+	if envPath := os.Getenv("CHROME_PATH"); envPath != "" {
+		tried = append(tried, envPath)
+		if info, err := os.Stat(envPath); err == nil && !info.IsDir() {
+			return envPath, nil
+		}
+	}
+
+	for _, p := range chromeCandidatePaths {
+		tried = append(tried, p)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"no chrome/chromium binary found — tried: %s",
+		strings.Join(tried, ", "),
+	)
+}
+
 func (a *App) initBrowser() {
 	allocOpts := append(
 		chromedp.DefaultExecAllocatorOptions[:],
@@ -166,8 +208,13 @@ func (a *App) initBrowser() {
 		chromedp.Flag("mute-audio", true),
 	)
 
-	if execPath := os.Getenv("CHROME_PATH"); execPath != "" {
+	if execPath, err := findChromeExecPath(); err == nil {
 		allocOpts = append(allocOpts, chromedp.ExecPath(execPath))
+	} else {
+		a.browserErr = err
+		fmt.Fprintln(os.Stderr, err)
+		close(a.browserReady)
+		return
 	}
 
 	allocCtx, _ := chromedp.NewExecAllocator(
