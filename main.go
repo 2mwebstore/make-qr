@@ -321,10 +321,22 @@ func (a *App) health(
 
 	select {
 	case <-a.browserReady:
-		if a.browserErr != nil {
+		a.mu.RLock()
+		ctx := a.browserCtx
+		berr := a.browserErr
+		a.mu.RUnlock()
+
+		switch {
+		case berr != nil:
 			resp["browser"] = "error"
-			resp["browser_error"] = a.browserErr.Error()
-		} else {
+			resp["browser_error"] = berr.Error()
+		case ctx != nil && ctx.Err() != nil:
+			// Launched fine initially but has since died (e.g. OOM
+			// kill) — the old handler could never report this since
+			// it only ever checked the initial-launch error.
+			resp["browser"] = "crashed"
+			resp["browser_error"] = ctx.Err().Error()
+		default:
 			resp["browser"] = "ready"
 		}
 	default:
