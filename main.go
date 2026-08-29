@@ -224,6 +224,22 @@ func (a *App) launchBrowser() (context.Context, error) {
 		chromedp.Flag("no-first-run", true),
 		chromedp.Flag("metrics-recording-only", true),
 		chromedp.Flag("mute-audio", true),
+		// Aggressive memory-footprint reduction — the browser was
+		// getting OOM-killed roughly 18s after launch, so cut
+		// everything not needed to load and script a checkout page.
+		// --single-process + --no-zygote avoid a separate renderer
+		// process (the single biggest memory cost); the rest trims
+		// background subsystems Chrome normally keeps warm.
+		chromedp.Flag("single-process", true),
+		chromedp.Flag("no-zygote", true),
+		chromedp.Flag("disable-background-timer-throttling", true),
+		chromedp.Flag("disable-backgrounding-occluded-windows", true),
+		chromedp.Flag("disable-breakpad", true),
+		chromedp.Flag("disable-component-update", true),
+		chromedp.Flag("disable-domain-reliability", true),
+		chromedp.Flag("disable-ipc-flooding-protection", true),
+		chromedp.Flag("renderer-process-limit", "1"),
+		chromedp.Flag("js-flags", "--max-old-space-size=128"),
 	)
 
 	execPath, err := findChromeExecPath()
