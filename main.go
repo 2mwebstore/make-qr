@@ -118,12 +118,19 @@ type CreatePaymentRequest struct {
 }
 
 func main() {
+	// Pool/concurrency sizes are deliberately conservative — headless
+	// Chrome is memory-hungry, and on a small container (e.g. a basic
+	// Railway plan) each extra idle tab or concurrent setup raises the
+	// odds of an OOM kill, which is what silently kills the shared
+	// browser context and used to make every request fail afterward
+	// with "context canceled" until now. If you're on a larger plan
+	// with memory to spare, these can be raised for more throughput.
 	app := &App{
 		payments:     make(map[int64]*Payment),
-		warmTabs:     make(chan warmTab, 2),
-		poolSize:     2,
+		warmTabs:     make(chan warmTab, 1),
+		poolSize:     1,
 		browserReady: make(chan struct{}),
-		tabSetupSem:  make(chan struct{}, 3),
+		tabSetupSem:  make(chan struct{}, 2),
 	}
 
 	// Chrome starts in the background — the HTTP server (and /health)
@@ -195,7 +202,10 @@ func findChromeExecPath() (string, error) {
 	)
 }
 
-func (a *App) initBrowser() {
+// launchBrowser starts a fresh Chrome process and returns its
+// long-lived browser-level context. Used both for the initial startup
+// and for self-healing relaunches if Chrome later crashes.
+func (a *App) launchBrowser() (context.Context, error) {
 	allocOpts := append(
 		chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
@@ -216,14 +226,11 @@ func (a *App) initBrowser() {
 		chromedp.Flag("mute-audio", true),
 	)
 
-	if execPath, err := findChromeExecPath(); err == nil {
-		allocOpts = append(allocOpts, chromedp.ExecPath(execPath))
-	} else {
-		a.browserErr = err
-		fmt.Fprintln(os.Stderr, err)
-		close(a.browserReady)
-		return
+	execPath, err := findChromeExecPath()
+	if err != nil {
+		return nil, err
 	}
+	allocOpts = append(allocOpts, chromedp.ExecPath(execPath))
 
 	allocCtx, _ := chromedp.NewExecAllocator(
 		context.Background(),
@@ -239,16 +246,68 @@ func (a *App) initBrowser() {
 	defer launchCancel()
 
 	if err := chromedp.Run(launchCtx); err != nil {
-		a.browserErr = fmt.Errorf("chrome launch failed: %w", err)
-		fmt.Fprintln(os.Stderr, a.browserErr)
+		return nil, fmt.Errorf("chrome launch failed: %w", err)
+	}
+
+	return browserCtx, nil
+}
+
+func (a *App) initBrowser() {
+	browserCtx, err := a.launchBrowser()
+	if err != nil {
+		a.browserErr = err
+		fmt.Fprintln(os.Stderr, err)
 		close(a.browserReady)
 		return
 	}
 
+	a.mu.Lock()
 	a.browserCtx = browserCtx
+	a.mu.Unlock()
+
 	close(a.browserReady)
 
 	a.maintainWarmPool()
+}
+
+// getBrowserCtx returns a live browser context, transparently
+// relaunching Chrome if the previous instance has died — e.g. crashed
+// under memory pressure — instead of every request failing forever
+// with "context canceled" once that happens once.
+func (a *App) getBrowserCtx() (context.Context, error) {
+	<-a.browserReady
+
+	a.mu.RLock()
+	ctx := a.browserCtx
+	berr := a.browserErr
+	a.mu.RUnlock()
+
+	if berr != nil {
+		return nil, berr
+	}
+
+	if ctx != nil && ctx.Err() == nil {
+		return ctx, nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Re-check under the lock — another request may have already
+	// relaunched while we were waiting for it.
+	if a.browserCtx != nil && a.browserCtx.Err() == nil {
+		return a.browserCtx, nil
+	}
+
+	fmt.Fprintln(os.Stderr, "chrome context dead — relaunching")
+
+	newCtx, err := a.launchBrowser()
+	if err != nil {
+		return nil, fmt.Errorf("chrome relaunch failed: %w", err)
+	}
+
+	a.browserCtx = newCtx
+	return newCtx, nil
 }
 
 func (a *App) health(
@@ -477,13 +536,12 @@ var resourceBlockPatterns = []*network.BlockPattern{
 // event listener is attached here — those are added by whoever
 // consumes the tab, since they need the specific payment in scope.
 func (a *App) newPreparedTab() (context.Context, context.CancelFunc, error) {
-	// Waits for Chrome startup to finish (success or failure) instead
-	// of assuming a.browserCtx is already set — a request can arrive
-	// before initBrowser finishes, especially right after a cold start.
-	<-a.browserReady
-
-	if a.browserErr != nil {
-		return nil, nil, a.browserErr
+	// Waits for the initial launch and transparently relaunches Chrome
+	// if it has since crashed, instead of every call failing forever
+	// once that happens.
+	browserCtx, err := a.getBrowserCtx()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Caps how many tab-setup operations run at once. Without this, a
@@ -498,7 +556,7 @@ func (a *App) newPreparedTab() (context.Context, context.CancelFunc, error) {
 		return nil, nil, fmt.Errorf("timed out waiting for a free browser slot")
 	}
 
-	ctx, cancel := chromedp.NewContext(a.browserCtx)
+	ctx, cancel := chromedp.NewContext(browserCtx)
 
 	// Bound the setup itself — if a navigation or selector wait ever
 	// stalls (Chrome overloaded, page unresponsive), this must fail
